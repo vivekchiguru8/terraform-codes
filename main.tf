@@ -13,88 +13,89 @@ provider "google" {
   zone    = "us-central1-a"
 }
 
-# 1. VPC with no auto subnets
-resource "google_compute_network" "vpc_network" {
-  name                    = "custom-vpc"
+# VPC network for the cluster
+resource "google_compute_network" "vpc" {
+  name                    = "gke-network"
   auto_create_subnetworks = false
-  mtu                     = 1460
 }
 
-# 2. Custom subnet
-resource "google_compute_subnetwork" "custom_subnet" {
-  name          = "custom-subnet"
+resource "google_compute_subnetwork" "subnet" {
+  name          = "gke-subnet"
   ip_cidr_range = "10.10.0.0/24"
   region        = "us-central1"
-  network       = google_compute_network.vpc_network.id
-} # <-- THIS BRACE WAS MISSING
+  network       = google_compute_network.vpc.id
 
-# 3. Firewall for SSH + HTTP
-resource "google_compute_firewall" "allow_ssh" {
-  name    = "allow-ssh"
-  network = google_compute_network.vpc_network.name # <-- FIXED: was .vpc.name
-
-  allow {
-    protocol = "tcp"
-    ports    = ["22"]
+  secondary_ip_range {
+    range_name    = "pod-range"
+    ip_cidr_range = "10.20.0.0/16"
   }
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["ssh-enabled"]
+  secondary_ip_range {
+    range_name    = "svc-range"
+    ip_cidr_range = "10.30.0.0/16"
+  }
 }
 
-resource "google_compute_firewall" "allow_http" {
-  name    = "allow-http"
-  network = google_compute_network.vpc_network.name # <-- FIXED: was .vpc.name
+resource "google_container_cluster" "primary" {
+  name     = "gke-standard-cluster"
+  location = "us-central1"
+  
+  remove_default_node_pool = true
+  initial_node_count       = 1
 
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443", "8080"]
+  network    = google_compute_network.vpc.name
+  subnetwork = google_compute_subnetwork.subnet.name
+
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pod-range"
+    services_secondary_range_name = "svc-range"
   }
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["http-server"]
-}
 
-# 4. VM Instance
-resource "google_compute_instance" "vm_instance" {
-  name         = "my-vm"
-  machine_type = "e2-medium"
-  zone         = "us-central1-a"                # <-- FIXED: was us-central1
-  tags         = ["ssh-enabled", "http-server"] # <-- ADDED: to match firewall rules
+  workload_identity_config {
+    workload_pool = "project-8f3b3c8e-4647-4878-8b5.svc.id.goog"  # Fixed: use real project ID
+  }
 
-  boot_disk {
-    initialize_params {
-      image = "debian-cloud/debian-12"
-      size  = 20
-      type  = "pd-balanced"
+  private_cluster_config {
+    enable_private_nodes    = true
+    master_ipv4_cidr_block  = "172.16.0.0/28"
+  }
+} # <-- THIS BRACE WAS MISSING. Closes the cluster resource.
+
+# Separate node pool - this is where your pods actually run
+resource "google_container_node_pool" "primary_nodes" {
+  name       = "primary-node-pool"
+  location   = "us-central1"
+  cluster    = google_container_cluster.primary.name
+  node_count = 1
+
+  autoscaling {
+    min_node_count = 1
+    max_node_count = 3
+  }
+
+  node_config {
+    machine_type = "e2-medium"
+    disk_size_gb = 50
+    disk_type    = "pd-standard"  # <-- REMOVED the extra } that was here
+    
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
     }
-  }
 
-  network_interface {
-    subnetwork = google_compute_subnetwork.custom_subnet.id
-    access_config {}
-  }
+    labels = {
+      env = "dev"
+    }
+  } # <-- This closes node_config
 
-  metadata = {
-    ssh-keys = "${var.ssh_user}:${file(var.ssh_pub_key_path)}"
+  management {
+    auto_repair  = true
+    auto_upgrade = true
   }
-
-  metadata_startup_script = <<-EOF
-    #!/bin/bash
-    apt-get update
-    apt-get install -y nginx
-    systemctl start nginx
-    echo "Hello from Terraform" > /var/www/html/index.html
-  EOF
 }
 
-# 5. Variables - YOU NEED THIS BLOCK
-variable "ssh_user" {
-  description = "SSH username"
-  type        = string
-  default     = "ubuntu"
-}
-
-variable "ssh_pub_key_path" {
-  description = "Path to SSH public key"
-  type        = string
-  default     = "~/.ssh/id_rsa.pub"
+output "kubeconfig_command" {
+  value = "gcloud container clusters get-credentials ${google_container_cluster.primary.name} --region ${google_container_cluster.primary.location}"
 }
